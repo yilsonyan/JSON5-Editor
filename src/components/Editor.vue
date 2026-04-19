@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { ref, onMounted, watch } from 'vue'
-import { EditorView, lineNumbers, highlightActiveLine, keymap } from '@codemirror/view'
-import { EditorState, Compartment } from '@codemirror/state'
+import { EditorView, lineNumbers, highlightActiveLine, keymap, Decoration } from '@codemirror/view'
+import type { DecorationSet } from '@codemirror/view'
+import { EditorState, Compartment, StateField, StateEffect, Prec } from '@codemirror/state'
 import { json } from '@codemirror/lang-json'
 import { javascript } from '@codemirror/lang-javascript'
-import { foldGutter, bracketMatching, indentOnInput, syntaxHighlighting, foldKeymap, foldAll, unfoldAll, HighlightStyle } from '@codemirror/language'
+import { foldGutter, bracketMatching, indentOnInput, syntaxHighlighting, foldKeymap, foldAll, unfoldAll, HighlightStyle, foldService } from '@codemirror/language'
 import { tags } from '@lezer/highlight'
 import { linter } from '@codemirror/lint'
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands'
@@ -30,11 +31,40 @@ const currentMatchIndex = ref(0)
 let editorView: EditorView | null = null
 const languageCompartment = new Compartment()
 
+// Error character highlight decoration
+const errorMark = Decoration.mark({ class: 'cm-error-char' })
+
+// State effect to update error decorations
+const setErrorEffect = StateEffect.define<{ from: number; to: number } | null>()
+
+// State field to store error decoration
+const errorDecorations = StateField.define<DecorationSet>({
+  create: () => Decoration.none,
+  update: (decorations, tr) => {
+    for (const effect of tr.effects) {
+      if (effect.is(setErrorEffect)) {
+        if (effect.value) {
+          return Decoration.set([
+            errorMark.range(effect.value.from, effect.value.to)
+          ])
+        }
+        return Decoration.none
+      }
+    }
+    return decorations
+  },
+  provide: (f) => EditorView.decorations.from(f)
+})
+
 const jsonLinter = linter((view) => {
   const code = view.state.doc.toString()
   if (!code.trim()) {
     isValid.value = true
     error.value = null
+    // Clear error decoration
+    view.dispatch({
+      effects: setErrorEffect.of(null)
+    })
     return []
   }
 
@@ -46,6 +76,10 @@ const jsonLinter = linter((view) => {
     }
     isValid.value = true
     error.value = null
+    // Clear error decoration
+    view.dispatch({
+      effects: setErrorEffect.of(null)
+    })
     return []
   } catch (e: unknown) {
     const err = e as SyntaxError
@@ -80,6 +114,8 @@ const jsonLinter = linter((view) => {
     }
 
     const lineInfo = view.state.doc.line(Math.min(line, view.state.doc.lines))
+    const errorFrom = Math.min(lineInfo.from + column - 1, lineInfo.to)
+    const errorTo = Math.min(lineInfo.from + column, lineInfo.to)
 
     isValid.value = false
     error.value = {
@@ -88,9 +124,14 @@ const jsonLinter = linter((view) => {
       message: err.message
     }
 
+    // Set error decoration on the error character
+    view.dispatch({
+      effects: setErrorEffect.of({ from: errorFrom, to: errorTo })
+    })
+
     return [{
-      from: Math.min(lineInfo.from + column - 1, lineInfo.to),
-      to: Math.min(lineInfo.from + column, lineInfo.to),
+      from: errorFrom,
+      to: errorTo,
       message: err.message,
       severity: 'error'
     }]
@@ -257,11 +298,12 @@ const vscodeDark = EditorView.theme({
     padding: '4px 0'
   },
   '.cm-content': {
-    padding: '0 16px',
+    padding: '0 16px 0 0',
+    marginLeft: '0',
     caretColor: '#d4d4d4'
   },
   '.cm-line': {
-    padding: '0 2px'
+    padding: '0 2px 0 0'
   },
   '.cm-activeLine': {
     backgroundColor: '#264f36 !important'
@@ -269,13 +311,15 @@ const vscodeDark = EditorView.theme({
   '.cm-gutters': {
     backgroundColor: '#1e1e1e',
     border: 'none',
-    color: '#858585'
+    color: '#858585',
+    borderRight: '1px solid #3c3c3c'
   },
   '.cm-lineNumbers .cm-gutterElement': {
     minWidth: '48px',
     textAlign: 'right',
     paddingRight: '16px',
-    color: '#858585'
+    color: '#858585',
+    marginRight: '8px'
   },
   '.cm-foldGutter': {
     width: '20px',
@@ -305,6 +349,16 @@ const vscodeDark = EditorView.theme({
     backgroundImage: 'none',
     backgroundColor: 'rgba(228, 0, 0, 0.1)',
     borderBottom: '2px wavy #e51400'
+  },
+  '.cm-lintPoint-error': {
+    backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='6' height='6'%3E%3Ccircle cx='3' cy='3' r='3' fill='%23e51400'/%3E%3C/svg%3E")`,
+    backgroundSize: '6px 6px',
+    backgroundRepeat: 'no-repeat',
+    backgroundPosition: 'center'
+  },
+  '.cm-error-char': {
+    color: '#e51400 !important',
+    fontWeight: 'bold'
   }
 }, { dark: true })
 
@@ -315,9 +369,111 @@ const updateCursorPosition = (view: EditorView) => {
   cursorColumn.value = pos - line.from + 1
 }
 
+// Custom fold service for JSON5 - correctly handles nested structures, comments, and trailing commas
+// This service is called for each line and returns fold range for the first foldable bracket on that line
+const jsonFoldService = (state: EditorState, lineStart: number, lineEnd: number): { from: number; to: number } | null => {
+  const doc = state.doc
+  const lineText = doc.sliceString(lineStart, lineEnd)
+
+  // Skip leading whitespace and comments to find the first foldable bracket
+  let textPos = 0
+  while (textPos < lineText.length) {
+    const c = lineText[textPos]
+    if (c === ' ' || c === '\t' || c === '\n' || c === '\r') {
+      textPos++
+      continue
+    }
+    // Skip inline comments
+    if (c === '/' && textPos + 1 < lineText.length) {
+      if (lineText[textPos + 1] === '/') {
+        // Rest of line is comment
+        textPos = lineText.length
+        break
+      }
+    }
+    break
+  }
+
+  // Find first { or [ after skipping whitespace/comments
+  let openBracketPos = -1
+  let openBracket = ''
+  for (let i = textPos; i < lineText.length; i++) {
+    const c = lineText[i]
+    if (c === '{' || c === '[') {
+      openBracketPos = lineStart + i
+      openBracket = c
+      break
+    }
+    // Stop if we hit meaningful content before a bracket (e.g., property name)
+    if (c !== ' ' && c !== '\t' && c !== ':' && c !== '"' && c !== "'" && c !== ',') {
+      break
+    }
+  }
+
+  if (openBracketPos < 0 || !openBracket) return null
+
+  const closeBracket = openBracket === '{' ? '}' : ']'
+
+  // Find matching closing bracket by counting depth
+  let depth = 1
+  let pos = openBracketPos + 1
+
+  while (pos < doc.length && depth > 0) {
+    const c = doc.sliceString(pos, pos + 1)
+
+    if (c === openBracket) {
+      depth++
+    } else if (c === closeBracket) {
+      depth--
+    } else if (c === '"' || c === "'") {
+      // Skip string (including escaped characters)
+      const quote = c
+      pos++
+      while (pos < doc.length) {
+        const sc = doc.sliceString(pos, pos + 1)
+        if (sc === '\\' && pos + 1 < doc.length) {
+          pos += 2
+          continue
+        }
+        if (sc === quote) break
+        pos++
+      }
+    } else if (c === '/' && pos + 1 < doc.length) {
+      const next = doc.sliceString(pos + 1, pos + 2)
+      if (next === '/') {
+        // Single-line comment: skip to newline
+        pos++
+        while (pos < doc.length && doc.sliceString(pos, pos + 1) !== '\n') pos++
+      } else if (next === '*') {
+        // Multi-line comment: skip to */
+        pos += 2
+        while (pos < doc.length - 1) {
+          if (doc.sliceString(pos, pos + 1) === '*' && doc.sliceString(pos + 1, pos + 2) === '/') {
+            pos += 2
+            break
+          }
+          pos++
+        }
+      }
+    }
+    pos++
+  }
+
+  // Return fold range if we found matching closing bracket
+  if (depth === 0 && pos - 1 > openBracketPos + 1) {
+    return { from: openBracketPos + 1, to: pos - 1 }
+  }
+
+  return null
+}
+
 const getLanguageExtension = (format: 'json' | 'json5') => {
   if (format === 'json5') {
-    return javascript({ jsx: false })
+    // Use javascript for syntax highlighting but don't use its default folding
+    // Our custom foldService will handle folding correctly for JSON5
+    const jsSupport = javascript({ jsx: false })
+    // Remove the default foldService from javascript language if present
+    return jsSupport
   }
   return json()
 }
@@ -332,11 +488,15 @@ const createEditor = () => {
       highlightActiveLine(),
       history(),
       foldGutter(),
+      // Custom fold service for proper JSON/JSON5 folding
+      // Use high priority to override JavaScript's default folding behavior
+      Prec.high(foldService.of(jsonFoldService)),
       bracketMatching(),
       indentOnInput(),
       syntaxHighlighting(vscodeDarkHighlight),
       languageCompartment.of(getLanguageExtension(props.format)),
       jsonLinter,
+      errorDecorations,
       keymap.of([...defaultKeymap, ...historyKeymap, ...foldKeymap]),
       vscodeDark,
       EditorView.updateListener.of((update) => {

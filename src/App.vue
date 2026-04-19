@@ -197,9 +197,16 @@ const handleFormatChange = (format: 'json' | 'json5') => {
 }
 
 const handleOpenFromPath = async (filePath: string) => {
-  // Wait for editor to be ready
+  // Wait for editor to be ready with multiple retries
+  let retries = 0
+  while (!editorRef.value && retries < 10) {
+    await new Promise(resolve => setTimeout(resolve, 100))
+    retries++
+  }
+
   if (!editorRef.value) {
-    await new Promise(resolve => setTimeout(resolve, 300))
+    console.error('Editor not ready after multiple retries')
+    return
   }
 
   const fileContent = await openFileFromPath(filePath)

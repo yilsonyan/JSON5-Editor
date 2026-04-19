@@ -18,6 +18,8 @@
 
 ![JSON5 语法支持](doc/json5-support.jpg)
 
+![JSON5 标准](doc/json5-standerd.jpg)
+
 ![实时语法检查](doc/real-time-grammar-checking.jpg)
 
 ## 安装
@@ -38,9 +40,6 @@ cd json5-editor
 
 # 安装依赖
 npm install
-
-# 开发模式
-npm run tauri dev
 
 # 正式构建
 npm run tauri build
